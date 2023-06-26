@@ -1,0 +1,61 @@
+let adjustedMaintStart = case({Maintenance_Period} == 1, {Maintenance_Window:start} - startofweek({Maintenance_Window:start}), {Maintenance_Window:start} - startofday({Maintenance_Window:start})); //maintenance window variable dynamically set by parameters
+let adjustedMaintEnd = case({Maintenance_Period} == 1, {Maintenance_Window:end} - startofweek({Maintenance_Window:end}), {Maintenance_Window:end} - startofday({Maintenance_Window:end})); //maintenance window variable dynamically set by parameters
+availabilityResults
+| where name in ({WebTests}) //web test filter
+| extend startLocalMaintenanceWindow = case({Maintenance_Period} == 1, startofweek(timestamp) + adjustedMaintStart, startofday(timestamp) + adjustedMaintStart) //beginning of maintenance filter
+| extend endLocalMaintenanceWindow = case({Maintenance_Period} == 1, startofweek(timestamp) + adjustedMaintEnd, startofday(timestamp) + adjustedMaintEnd)
+| where case({Maintenance_Period} == 1, timestamp !between (startLocalMaintenanceWindow .. endLocalMaintenanceWindow), 
+            {Maintenance_Period} == 2, timestamp > endLocalMaintenanceWindow or timestamp < startLocalMaintenanceWindow, 
+            timestamp == timestamp) //end of maintenance filter
+| project name, timestamp, duration, appName, location, success
+| project name, success, location, duration, appName, timestamp
+| where duration > 0
+| extend Outage = case(success contains '1', 0, 1)
+| summarize sum(Outage), avg(duration), recentOutageTimestamp = datetime_utc_to_local(maxif(timestamp, Outage == 1),"Asia/Seoul") by name, appName, bin(timestamp, {OutageWindow}m)
+| summarize ['Success Bins'] = todouble(countif(sum_Outage < toint({FailureThreshold}))), ['Fail Bins'] = todouble(countif(sum_Outage >= toint({FailureThreshold}))), ['Total Bins'] = todouble(count()), ['Max Duration'] = max(avg_duration), ['Avg Duration'] = avg(avg_duration), ['recentOutageTimestamp'] = maxif(recentOutageTimestamp, sum_Outage > 0) by name, appName
+| extend ['Web Test'] = 'Web Test', ['Test Success %'] = (['Success Bins'] / ['Total Bins'])*100
+| join kind=leftouter (
+    availabilityResults
+    | where name in ({WebTests})
+    | extend startLocalMaintenanceWindow = case({Maintenance_Period} == 1, startofweek(timestamp) + adjustedMaintStart, startofday(timestamp) + adjustedMaintStart)
+    | extend endLocalMaintenanceWindow = case({Maintenance_Period} == 1, startofweek(timestamp) + adjustedMaintEnd, startofday(timestamp) + adjustedMaintEnd)
+    | where case({Maintenance_Period} == 1, timestamp !between (startLocalMaintenanceWindow .. endLocalMaintenanceWindow), 
+            {Maintenance_Period} == 2, timestamp > endLocalMaintenanceWindow or timestamp < startLocalMaintenanceWindow, 
+            timestamp == timestamp)
+    | project name, timestamp, startLocalMaintenanceWindow, endLocalMaintenanceWindow, duration, appName, location, success
+    | extend Outage = case(success contains '1', 0, 1)
+    | project name, appName, timestamp, location, Outage
+    | summarize sum(Outage) by appName, name, bin(timestamp, {OutageWindow}m)
+    | sort by appName, name, timestamp
+    | where sum_Outage >= {FailureThreshold} //filter down to outages only
+    | extend OutageClassification = case(
+    name != prev(name), 'End of Outage', //bracket test name by final outage
+    name != next(name), 'Beginning of Outage', //bracket test name by initial outage time
+    name == next(name) and next(timestamp) == timestamp - {OutageWindow}m, 'Inner Outage', //if the previous record has a timestamp with the outage window difference then same outage
+    name == next(name) and next(timestamp) != timestamp - {OutageWindow}m, 'Beginning', //if the next timestamp is different by more than outagewindow then it is a new outage
+    'ELSE')
+    | extend OutageClassification = case(
+    name != prev(name) and name != next(name), 'Singular Outage',
+    OutageClassification == 'Beginning of Outage' and prev(timestamp) != timestamp + {OutageWindow}m, 'Singular Outage' ,//Single bin outage
+ OutageClassification == 'Beginning' and prev(OutageClassification) == 'Beginning', 'Singular Outage',//Single bin outage
+OutageClassification == 'End of Outage' and next(timestamp) != timestamp - {OutageWindow}m, 'Singular Outage' //Single bin outage
+    ,OutageClassification)
+    | extend OutageClassification = case(
+    OutageClassification == 'Inner Outage' and prev(timestamp) != timestamp + {OutageWindow}m, 'Ending' //identify time shifts that signify end of outages
+    ,OutageClassification)
+    | where OutageClassification != 'Inner Outage' //filter out unnecessary values
+    | extend BeginningDate = case(
+    OutageClassification == 'End of Outage', next(timestamp),
+    OutageClassification == 'Ending', next(timestamp)
+    ,timestamp) //set the correct beginning date based on record
+    | extend EndingDate = case(
+    OutageClassification == 'Singular Outage', timestamp + {OutageWindow}m
+    ,timestamp) //consolidate records around the outage ending record
+    | where OutageClassification != 'Beginning of Outage' and OutageClassification != 'Beginning' //filter down to the full instances
+    | extend TotalOutageTime = EndingDate - BeginningDate
+    | summarize count() by name, appName
+    | project name, appName,['Outage Count'] = count_
+        ) on name, appName
+| extend ['Target 9s'] = iff(['Test Success %'] > {Target_Nines}, 1, 0)
+| extend ['Outage Count'] = iif(['Outage Count'] > 0, ['Outage Count'], 0)
+| project ['Web Test'], name, appName, ['Success Bins'], ['Fail Bins'], ['Total Bins'],['Avg Duration'],['Max Duration'],['Test Success %'],['Outage Count'], ['Target 9s'], ['recentOutageTimestamp']
